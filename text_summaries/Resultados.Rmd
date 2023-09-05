@@ -1,0 +1,400 @@
+---
+title: "Machine learning para evaluar la calidad de resúmenes escritos por estudiantes con R y librerías de Python"
+author: "Pedro Abraham Montoya Calzada"
+date: 
+output: pdf_document
+---
+
+\section{Introducción}
+Los lenguajes de programación: Python y R, son dos de los más utilizados en ciencia de datos y aprendizaje automático, cada lenguaje tiene sus ventajas y desventajas, por ejemplo: Python es excelente a la hora de crear modelos de aprendizaje automático, pues cuenta con librerías muy potentes como; TensorFlow, scikit-learn, pandas, etc. Que facilitan bastante esas tareas, sin embargo, el poder de R en el análisis estadístico y en le visualización de datos es sobresaliente.
+
+Este proyecto lo hice con la intención de mostrar que se puede obtener lo mejor de ambos lenguajes, el objetivo de este trabajo es construir un modelo de regresión, que sea capas de dar una calificación de forma automática a resúmenes de texto creados por estudiantes. Utilizando en todo momento el lenguaje R pero combinándolo con dos de las más potentes librerías de Python: TensorFlow y scikit-learn.
+
+Los datos que se utilizaron fueron tomados estan disponibles [**aquí.**](https://www.kaggle.com/competitions/commonlit-evaluate-student-summaries)
+
+Los datos cuentan con 5 columnas, las dos primeras son id de identificación, la tercera es el texto escrito por los estudiantes, la cuarta es content: la puntuación de contenido para el resumen y la última columna es wording: la puntuación de redacción del resumen. La tercera columna será la entrada del algoritmo, y las ultimas dos columnas son el objetivo a predecir, sin embargo, en esta ocasión, solo se va a trabajar con la variable "content".
+
+\section{Análisis de datos y visualización}
+
+\subsection{Estadísticas descriptivas de la puntuación del contenido}
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+library(ggplot2)
+library(tidyverse)
+library(knitr)
+library(tm)
+library(plotly)
+library(ggExtra)
+library(patchwork)
+library(tensorflow)
+library(keras)
+
+df <- read.csv('summaries_train.csv')
+```
+
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+resumen <- summary(df$content)
+values <- as.vector(resumen)
+names <- names(resumen)
+
+resumen <- data.frame(Valor = values)
+row.names(resumen) <- names
+
+kable(resumen)
+```
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE,fig.width=7, fig.height=3,fig.align='center'}
+g <- ggplot(df, aes(x = content)) +
+  geom_histogram(aes(y =..density..), color="black",
+                 fill = "#1B96B5", bins = 20) +
+  geom_density(alpha = 0.1, fill = "green",
+               color = "green") + 
+  scale_fill_manual(values = cols) + 
+  theme(plot.title = element_text(hjust = 0.5))+
+  labs(title = "Histograma de la variable Content")
+g
+
+```
+
+\subsection{Palabras más frecuentes}
+
+Las stop words (palabras vacías o palabras de paro en español) son palabras que se filtran o eliminan de un texto durante el procesamiento de lenguaje natural (NLP) porque se consideran comunes y poco informativas en términos de contenido semántico. Sin embargo, para este proyecto decidí no utilizarlas, porque si algún estudiante utiliza en exceso ese tipo de palabras, podría ser causa de penalización, y por lo tanto, recibir una calificación más baja.
+
+
+```{r,warning=FALSE, message=FALSE, echo=FALSE}
+clean <- function(txt){
+  txt_new <- tolower(txt)
+  txt_new <- gsub("[0-9]", "", txt_new)
+  txt_new <- gsub("[[:punct:]]", "", txt_new)
+  txt_new <- iconv(txt_new, "UTF-8", "ASCII//TRANSLIT")
+  txt_new <- gsub("\\s+", " ", txt_new)
+  return(txt_new)
+  
+}
+
+df$text <- clean(df$text)
+```
+
+
+
+```{r,warning=FALSE, message=FALSE, echo=FALSE}
+corpus <- Corpus(VectorSource(df$text))
+
+tdm <- TermDocumentMatrix(corpus)
+m <- as.matrix(tdm)
+word_freq <- rowSums(m)
+
+word_freq_df <- data.frame(word = names(word_freq),
+                           freq = word_freq)
+word_freq_df <- word_freq_df %>% 
+  arrange(desc(freq))
+
+```
+
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE,fig.width=7, fig.height=3,fig.align='center'}
+n <- 20
+p <- ggplot(word_freq_df[1:n,],
+       aes(x = reorder(word, -freq),y = freq))+
+      geom_col(aes(fill = as.factor(freq)),
+               show.legend = FALSE) + 
+  labs(title = 'Palabras con mayor frecuencia (primeras 20)',
+       x = "Palabras",y = "Frecuencia", 
+       fill = "") + 
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(size = 6))
+
+p
+
+```
+
+\subsection{Relación entre las palabras y la calificación recibida}
+
+La transformación TF-IDF (Term Frequency-Inverse Document Frequency) es una técnica utilizada en el procesamiento de lenguaje natural (NLP) para evaluar la importancia relativa de una palabra en un documento dentro de un conjunto de documentos más amplio.
+
+Ahora, vamos a ver como se relaciona el valor tf-idf de las 20 palabras más frecuentes con la variable respuesta: content.
+
+```{r, warning=FALSE, message=FALSE,echo=FALSE}
+library(reticulate)
+
+sklearn_f <- import("sklearn.feature_extraction.text")
+vectorizador <- sklearn_f$TfidfVectorizer
+vectorizador <- vectorizador()
+vectorizador <- vectorizador$fit(df$text)
+
+#obtener el valor Tfidf para todas las palabras
+features <- as.matrix(vectorizador$transform(df$text))
+colnames(features) <- vectorizador$get_feature_names_out()
+features <- as.data.frame(features)
+
+#Nos quedamos solo con las 20 palabras más frecuentes
+features <- features[,word_freq_df$word[1:20]]
+
+```
+
+
+```{r, echo=FALSE}
+corr <- data.frame(Word = c(),P = c(),
+                  S = c(),K = c())
+words <- colnames(features)
+for(i in 1:dim(features)[2]){
+  #Eliminar todas las oversavciones 
+  # en donde la palabra no aparecio
+  aux <-  features[,i] != 0
+  corr[i,1] <- words[i]
+  corr[i,2] <- cor(df$content[aux],features[,i][aux],
+                   method  = "p")
+  corr[i,3] <- cor(df$content[aux],features[,i][aux],
+                   method  = "s")
+  corr[i,4] <- cor(df$content[aux],features[,i][aux],
+                   method  = "k")
+}
+
+colnames(corr)<- c("Word","Pearson","Spearman","Kendall") 
+
+```
+
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE,fig.width=7, fig.height=4,fig.align='center'}
+ggplot(corr, aes(x = reorder(Word, Spearman), 
+                 y = Spearman,fill = as.factor(Word))) +
+  geom_bar(stat = "identity",
+           show.legend = FALSE) +
+  labs(x = "Palabras",y = "Correalción",
+       title = "Correlación de Spearman entre el Tf-idf
+       de las palabras y Content") + 
+  theme(axis.text.x = element_text(size = 7)) +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+La palabra “from” es la que presenta la relación más fuerte con la variable respuesta, vamos a ver el tipo de relación que hay con un diagrama de dispersión.
+
+
+```{r, echo=FALSE,fig.width=7, fig.height=4,fig.align='center'}
+g <- ggplot(features, aes(x = from,
+            y = df$content)) +
+  geom_point(color = "#1B96B5") + 
+  labs(y = "Content", x = "Tf-idf de la palabra from",
+       title = "Tf-idf de la plabra from vs content") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+ggMarginal(g, type = "histogram", 
+           xparams = list(fill = "#1B96B5"),
+           yparams = list(fill = "#1B96B5"))
+
+
+```
+
+
+\section{Creación y evaluación del modelo predictivo}
+
+
+El modelo que se construyo fue una red neuronal, se utilizo tensorflow y keras, a continuación, muestro la estructura de la red.
+
+```{r,warning=FALSE, message=FALSE,echo=FALSE}
+set.seed(pi)
+muestra_train <- sample(1:dim(df)[1],
+                  round(dim(df)[1]*.80),
+                  replace = FALSE)
+
+df_train <- df[muestra_train,]
+df_test <- df[-muestra_train,]
+
+
+sklearn_f <- import("sklearn.feature_extraction.text")
+vectorizador <- sklearn_f$TfidfVectorizer
+vectorizador <- vectorizador()
+vectorizador <- vectorizador$fit(df_train$text)
+
+X_train <- as.matrix(vectorizador$transform(df_train$text))
+colnames(X_train) <- vectorizador$get_feature_names_out()
+
+X_test <- as.matrix(vectorizador$transform(df_test$text))
+colnames(X_test) <- vectorizador$get_feature_names_out()
+
+y_train <- df$content[muestra_train]
+y_test <- df$content[-muestra_train]
+
+
+```
+
+
+```{r, eval=FALSE}
+model <- keras_model_sequential(input_shape = shape) %>%
+  layer_flatten() %>%
+  layer_dense(5, activation = "relu") %>%
+  layer_dense(5, activation = "relu") %>%
+  layer_dense(1)
+
+model %>% compile(
+  optimizer = "adam",
+  loss = "mse",
+  metrics = "mse"
+)
+
+```
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE,include=FALSE}
+shape = dim(X_train)[2]
+
+model <- keras_model_sequential(input_shape = shape) %>%
+  layer_flatten() %>%
+  layer_dense(5, activation = "relu") %>%
+  #layer_dropout(0.2) %>%
+  layer_dense(5, activation = "relu") %>%
+  layer_dense(1)
+
+
+model %>% compile(
+  optimizer = "adam",
+  loss = "mse",
+  metrics = "mse"
+)
+
+model %>% fit(X_train,y_train, epochs = 20,
+              validation_data = list(X_test, y_test)
+              )
+
+```
+
+
+
+Para entrenar el modelo se tomo de manera aleatoria una muestra con el 80% de las observaciones, el otro 20% se utilizó para evaluar el desempeño del modelo.
+
+```{r, echo=FALSE, message=FALSE, echo=FALSE,,include=FALSE}
+sklearn_metrics <- import("sklearn.metrics")
+mean_squared_error <- sklearn_metrics$mean_squared_error
+mean_absolute_error <- sklearn_metrics$mean_absolute_error
+r2_score <- sklearn_metrics$r2_score
+
+
+y_pred <- model %>% predict(X_train)
+
+MSE <- mean_squared_error(y_train,y_pred,squared=TRUE) #MSE
+RMSE <- mean_squared_error(y_train,y_pred,squared=FALSE) #RMSE
+MAE <- mean_absolute_error(y_train,y_pred) #MAE
+R2 <- r2_score(y_train,y_pred)
+
+res <- data.frame(MSE = MSE, RMSE = RMSE,
+                  MAE = MAE, R2 = R2)
+
+
+kable(res, caption = "Evaluación del modelo con los datos de entrenamiento")
+```
+
+
+```{r, echo=FALSE,warning=FALSE, message=FALSE}
+kable(res, caption = "Evaluación del modelo con los datos de prueba")
+```
+
+```{r,echo=FALSE,fig.width=7, fig.height=4,fig.align='center'}
+df_eval <- data.frame(y_train,y_pred)
+
+ggplot(df_eval) +
+  geom_density(aes(x = y_train, 
+                   fill = "Datos de entrenamiento"), 
+               alpha = 0.5, color = "green") +
+  geom_density(aes(x = y_pred, fill = "Predicciones"),
+               alpha = 0.5, color = "red") +
+  
+  # Personalizar colores en la leyenda y etiquetas
+  scale_fill_manual(
+    values = c("Datos de entrenamiento" = "green", 
+               "Predicciones" = "red"),
+    labels = c("Datos de entrenamiento", "Predicciones")
+  ) +
+  
+  guides(fill = guide_legend(title = "")) +
+    labs(
+    title = "Densidad de Datos Reales vs. Predicciones",
+    x = "Content",
+    y = "Densidad",
+    fill = "Variable"
+  ) + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+```
+
+
+```{r,echo=FALSE,fig.width=7, fig.height=4,fig.align='center'}
+
+ggplot(data = df_eval) + 
+  geom_point(aes(x = y_pred,y = y_train),
+             color = "#1B96B5") + 
+  labs(title = "Datos de entrenamiento vs predicciónes",
+       x = "Predicciones", y = "Content")  + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+
+
+```{r, echo=FALSE, message=FALSE, echo=FALSE,include=FALSE}
+y_pred <- model %>% predict(X_test)
+
+MSE <- mean_squared_error(y_test,y_pred,squared=TRUE) #MSE
+RMSE <- mean_squared_error(y_test,y_pred,squared=FALSE) #RMSE
+MAE <- mean_absolute_error(y_test,y_pred) #MAE
+R2 <- r2_score(y_test,y_pred)
+
+res <- data.frame(MSE = MSE, RMSE = RMSE,
+                  MAE = MAE, R2 = R2)
+
+```
+
+
+```{r, echo=FALSE,warning=FALSE, message=FALSE}
+kable(res, caption = "Evaluación del modelo con los datos de prueba")
+```
+
+
+```{r,echo=FALSE,fig.width=7, fig.height=4,fig.align='center'}
+df_eval <- data.frame(y_test,y_pred)
+
+ggplot(df_eval) +
+  geom_density(aes(x = y_test, 
+                   fill = "Datos de prueba"), 
+               alpha = 0.5, color = "green") +
+  geom_density(aes(x = y_pred, fill = "Predicciones"),
+               alpha = 0.5, color = "red") +
+  
+  # Personalizar colores en la leyenda y etiquetas
+  scale_fill_manual(
+    values = c("Datos de prueba" = "green", 
+               "Predicciones" = "red"),
+    labels = c("Datos de prueba", "Predicciones")
+  ) +
+  
+  guides(fill = guide_legend(title = "")) +
+    labs(
+    title = "Densidad de Datos Reales vs. Predicciones",
+    x = "Content",
+    y = "Densidad",
+    fill = "Variable"
+  ) + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+
+```{r,echo=FALSE,fig.width=7, fig.height=4,fig.align='center'}
+
+ggplot(data = df_eval) + 
+  geom_point(aes(x = y_pred,y = y_test),
+             color = "#1B96B5") + 
+  labs(title = "Datos de prueba vs predicciónes",
+       x = "Predicciones", y = "Content")  + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+\section{Conclusiones}
+
+Se logro construir un modelo que puede predecir la calificación que un resumen de texto va a obtener, el modelo obtuvo un error cuadrático medio de `r MSE` , lo cual es bastante bueno, sobre todo si se tiene en cuenta que es un modelo sencillo.
+Además, se pudo mostrar el potencial de ambos lenguajes de programación, pues, aunque todo se ejecuto en R, se utilizaron las que posiblemente sean las librerías más utilizadas en Python para ciencia de datos: tensorflow y sklearn. El modelo construido aquí se puede guardar y después cargar en un script de Python, y funcionará perfectamente en el entorno de Python, igual que como lo hizo en el entorno de R.
+
+
+
